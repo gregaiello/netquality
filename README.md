@@ -3,7 +3,12 @@
 A lightweight, ad-free desktop internet quality tester (PyQt6). It works like speedtest.net
 and adds deeper metrics, plus a diagnosis of what's wrong and how to fix it.
 
-## Run
+## Download
+
+Windows users can grab the standalone `NetQuality.exe` from the
+[latest release](https://github.com/gregaiello/netquality/releases/latest). No Python needed.
+
+## Run from source
 
 ```powershell
 python -m venv .venv
@@ -47,7 +52,8 @@ The test server is Cloudflare's public speed-test endpoints (`speed.cloudflare.c
 nearest PoP), the same ones https://speed.cloudflare.com uses. No account, no ads. ICMP on Windows
 uses `IcmpSendEcho`, so no admin rights are needed. Only dependency: PyQt6.
 
-A default test takes ~35 s and transfers roughly 10–60 s × your speed in data (e.g. ~300 MB at 100 Mbps).
+A default test takes ~45 s. It transfers about 10 s of data at full speed in each direction
+(e.g. ~250 MB in total at 100 Mbps down / 100 Mbps up).
 
 ## Tests
 
@@ -55,3 +61,7 @@ A default test takes ~35 s and transfers roughly 10–60 s × your speed in data
 .venv\Scripts\pip install pytest
 .venv\Scripts\python -m pytest tests
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
