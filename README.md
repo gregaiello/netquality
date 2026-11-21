@@ -1,7 +1,22 @@
+<img src="assets/netquality.png" width="72" align="left" alt="NetQuality logo">
+
 # NetQuality
 
 A lightweight, ad-free desktop internet quality tester (PyQt6). It works like speedtest.net
 and adds deeper metrics, plus a diagnosis of what's wrong and how to fix it.
+
+![Overview: live gauge, key metrics, verdict and the diagnosis with fixes](docs/overview.png)
+
+<table>
+<tr>
+<td><img src="docs/layers.png" alt="Layers: this PC vs home network vs internet on log scales"><br><b>Layers</b>: the slowest layer is your bottleneck</td>
+<td><img src="docs/charts.png" alt="Throughput and latency over time, latency distribution"><br><b>Charts</b>: throughput and latency (idle vs. under load)</td>
+</tr>
+<tr>
+<td><img src="docs/good-for.png" alt="Suitability per activity and estimated transfer times"><br><b>What it's good for</b>: activities and transfer times</td>
+<td></td>
+</tr>
+</table>
 
 ## Download
 
@@ -54,6 +69,10 @@ uses `IcmpSendEcho`, so no admin rights are needed. Only dependency: PyQt6.
 
 A default test takes ~45 s. It transfers about 10 s of data at full speed in each direction
 (e.g. ~250 MB in total at 100 Mbps down / 100 Mbps up).
+
+The test engine runs in a separate process, so the UI stays smooth while the link is saturated.
+The app icon is drawn in code (`paint_logo` in `netquality/widgets.py`); regenerate
+`assets/netquality.ico` / `.png` with `.venv\Scripts\python tools\make_icon.py`.
 
 ## Tests
 

@@ -3,21 +3,25 @@ from __future__ import annotations
 
 import html
 import json
+import multiprocessing as mp
+import queue
 import sys
-import traceback
+import time
+from dataclasses import asdict
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QGridLayout, QHBoxLayout,
-                             QHeaderView, QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-                             QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-                             QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor, QFont, QPixmap
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+                             QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+                             QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
+                             QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from . import diagnosis
-from .engine import Cancelled, SpeedTest, TestConfig
+from .engine import TestConfig
 from .history import History
-from .widgets import (BAD, DL, IDLE, MUTED, TEXT, UL, WARN, BoxPlot, Gauge, LayerChart, LineChart,
-                      MetricCard)
+from .runner import run_engine
+from .widgets import (BAD, DL, IDLE, MUTED, TEXT, UL, WARN, BoxPlot, CardGrid, ElidedLabel, Gauge, LayerChart,
+                      LineChart, MetricCard, SmoothProgress, app_icon, logo_image)
 
 STYLE = """
 QWidget { background: #12151c; color: #e6e9ef; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 10pt; }
@@ -43,7 +47,21 @@ QTreeWidget, QTableWidget, QTextBrowser, QPlainTextEdit { background: #1a1e27; b
 QHeaderView::section { background: #232835; color: #8a93a6; border: none; padding: 5px; }
 QTableWidget { gridline-color: #2a303c; }
 QToolTip { background: #232835; color: #e6e9ef; border: 1px solid #363d4c; }
+QScrollArea { border: none; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle { background: #363d4c; border-radius: 4px; min-height: 24px; min-width: 24px; }
+QScrollBar::handle:hover { background: #4a5263; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+QSplitter::handle { background: transparent; }
+QSplitter::handle:hover { background: #2a303c; }
+QLabel#status { color: #8a93a6; font-family: Consolas, monospace; }
 """
+
+SPINNER = "◐◓◑◒"
+POLL_MS = 30          # how often the UI drains engine events
+STOP_GRACE_S = 5.0    # after STOP, kill the engine process if it has not exited by then
 
 SEV_COLOR = {"critical": "#f87171", "warning": "#fbbf24", "info": "#60a5fa", "good": "#4ade80"}
 SEV_ICON = {"critical": "✖", "warning": "⚠", "info": "ℹ", "good": "✔"}
@@ -65,47 +83,71 @@ def grade_color(g: str) -> QColor:
     return {"A+": IDLE, "A": IDLE, "B": WARN, "C": WARN}.get(g, BAD if g in ("D", "F") else MUTED)
 
 
-class Worker(QThread):
-    event = pyqtSignal(str, dict)
-    done = pyqtSignal(dict)
-    failed = pyqtSignal(str)
+class EngineProcess:
+    """The measurement engine running in a child process (see runner.py), polled from the UI thread."""
 
     def __init__(self, cfg: TestConfig):
-        super().__init__()
-        self.test = SpeedTest(cfg, lambda e, d: self.event.emit(e, d))
-
-    def run(self):
-        try:
-            self.done.emit(self.test.run())
-        except Cancelled:
-            self.failed.emit("Test cancelled.")
-        except Exception as e:  # surface anything unexpected in the UI
-            self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+        ctx = mp.get_context("spawn")
+        self.queue = ctx.Queue()
+        self.cancel_event = ctx.Event()
+        self.proc = ctx.Process(target=run_engine, args=(asdict(cfg), self.queue, self.cancel_event),
+                                daemon=True, name="netquality-engine")
+        self.proc.start()
+        self.started = time.monotonic()
+        self.stop_requested: float | None = None
+        self.finished = False   # a "done"/"failed" message arrived
 
     def cancel(self):
-        self.test.cancel()
+        self.cancel_event.set()
+        self.stop_requested = time.monotonic()
+
+    def messages(self, limit: int = 500):
+        for _ in range(limit):
+            try:
+                yield self.queue.get_nowait()
+            except (queue.Empty, OSError, EOFError):
+                return
+
+    def alive(self) -> bool:
+        return self.proc.is_alive()
+
+    def kill(self):
+        if self.proc.is_alive():
+            self.proc.terminate()
+        self.proc.join(1)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NetQuality: local internet quality test")
-        self.resize(1180, 860)
         self.history = History()
-        self.worker: Worker | None = None
+        self.engine: EngineProcess | None = None
         self.result: dict | None = None
+        self.phase_label = ""
+        self.idle_ms = None
+        self.poll = QTimer(self)
+        self.poll.setInterval(POLL_MS)
+        self.poll.timeout.connect(self._poll_engine)
 
         root = QWidget()
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setContentsMargins(14, 10, 14, 10)
+        outer.setSpacing(6)
 
         # ---------------- header
         hdr = QHBoxLayout()
+        logo = QLabel()
+        dpr = self.devicePixelRatioF()
+        pm = QPixmap.fromImage(logo_image(round(30 * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        logo.setPixmap(pm)
+        hdr.addWidget(logo)
         title = QLabel("NetQuality")
         title.setStyleSheet("font-size: 16pt; font-weight: 700;")
         hdr.addWidget(title)
-        self.server_lbl = QLabel("Server: speed.cloudflare.com (nearest PoP)")
+        self.server_lbl = ElidedLabel("Server: speed.cloudflare.com (nearest PoP)")
         self.server_lbl.setObjectName("muted")
         hdr.addWidget(self.server_lbl, 1)
         hdr.addWidget(QLabel("Duration/dir (s)"))
@@ -129,17 +171,25 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self.toggle)
         hdr.addWidget(self.start_btn)
         outer.addLayout(hdr)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 1000)
+        prow = QHBoxLayout()
+        self.progress = SmoothProgress()
         self.progress.setFixedHeight(6)
-        outer.addWidget(self.progress)
+        prow.addWidget(self.progress, 1)
+        self.status_lbl = QLabel("")
+        self.status_lbl.setObjectName("status")
+        self.status_lbl.setFixedWidth(64)
+        self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        prow.addWidget(self.status_lbl)
+        outer.addLayout(prow)
 
-        # ---------------- top: gauge + cards
+        # ---------------- top: gauge + cards + verdict (resizable against the tabs via a splitter)
+        top_w = QWidget()
+        top_l = QVBoxLayout(top_w)
+        top_l.setContentsMargins(0, 0, 0, 0)
+        top_l.setSpacing(8)
         top = QHBoxLayout()
         self.gauge = Gauge()
-        top.addWidget(self.gauge, 4)
-        grid = QGridLayout()
-        grid.setSpacing(8)
+        top.addWidget(self.gauge, 3)
         self.cards = {
             "down": MetricCard("Download", "Mbps sustained", DL),
             "up": MetricCard("Upload", "Mbps sustained", UL),
@@ -152,21 +202,28 @@ class MainWindow(QMainWindow):
             "localhost": MetricCard("This PC (localhost)", "TCP loopback", QColor("#a3e635")),
             "lan": MetricCard("Home network capacity", "estimated, to router", WARN),
         }
-        for i, c in enumerate(self.cards.values()):
-            grid.addWidget(c, i // 2, i % 2)
-        gw = QWidget()
-        gw.setLayout(grid)
-        top.addWidget(gw, 5)
-        outer.addLayout(top, 4)
+        cards_col = QVBoxLayout()
+        cards_col.addStretch(1)
+        cards_col.addWidget(CardGrid(self.cards.values(), min_card_width=150))
+        cards_col.addStretch(1)
+        top.addLayout(cards_col, 7)
+        top_l.addLayout(top, 1)
 
         self.verdict = QLabel("Press START to run a full quality test (≈ 45 s, uses ~ 100–1000 MB depending on speed).")
         self.verdict.setObjectName("verdict")
         self.verdict.setWordWrap(True)
-        outer.addWidget(self.verdict)
+        top_l.addWidget(self.verdict)
 
         # ---------------- tabs
         self.tabs = QTabWidget()
-        outer.addWidget(self.tabs, 6)
+        self.split = QSplitter(Qt.Orientation.Vertical)
+        self.split.setChildrenCollapsible(False)
+        self.split.setHandleWidth(8)
+        self.split.addWidget(self._scroll(top_w))  # narrow windows: cards wrap and scroll instead of growing
+        self.split.addWidget(self.tabs)
+        self.split.setStretchFactor(0, 2)
+        self.split.setStretchFactor(1, 3)
+        outer.addWidget(self.split, 1)
 
         self.diag_view = QTextBrowser()
         self.diag_view.setOpenExternalLinks(True)
@@ -196,7 +253,7 @@ class MainWindow(QMainWindow):
         lowl.addWidget(self.sweep_table, 2)
         lsplit.addWidget(lower)
         ll.addWidget(lsplit)
-        self.tabs.addTab(layers, "Layers")
+        self.tabs.addTab(self._scroll(layers), "Layers")
 
         charts = QWidget()
         cl = QVBoxLayout(charts)
@@ -207,7 +264,7 @@ class MainWindow(QMainWindow):
         for wdg in (self.tp_chart, self.lat_chart, self.box):
             split.addWidget(wdg)
         cl.addWidget(split)
-        self.tabs.addTab(charts, "Charts")
+        self.tabs.addTab(self._scroll(charts), "Charts")
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Metric", "Value", "What it means"])
@@ -234,8 +291,9 @@ class MainWindow(QMainWindow):
         self.hist_chart = LineChart("History trend", "", "Mbps")
         hsplit.addWidget(self.hist_table)
         hsplit.addWidget(self.hist_chart)
+        self.hist_table.setMinimumHeight(110)
         hl.addWidget(hsplit)
-        self.tabs.addTab(hist, "History")
+        self.tabs.addTab(self._scroll(hist), "History")
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -244,8 +302,30 @@ class MainWindow(QMainWindow):
 
         self.refresh_history()
         self.diag_view.setHtml(self._intro_html())
+        self._fit_to_screen()
 
     # ------------------------------------------------------------------ helpers
+    def _fit_to_screen(self):
+        """Open at a size that fits the current screen (laptops with display scaling have ~700 px of height)."""
+        scr = self.screen() or QApplication.primaryScreen()
+        avail = scr.availableGeometry()
+        frame_h = 40  # title bar, not included in the client size
+        w = min(1240, int(avail.width() * 0.92))
+        h = min(900, int(avail.height() * 0.92) - frame_h)
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2, avail.y() + max(0, (avail.height() - h - frame_h) // 2))
+        self.split.setSizes([int(h * 0.42), int(h * 0.58)])
+
+    @staticmethod
+    def _scroll(page: QWidget) -> QScrollArea:
+        """Chart-heavy pages scroll instead of forcing the whole window taller than the screen."""
+        sa = QScrollArea()
+        sa.setWidget(page)
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return sa
+
     @staticmethod
     def _table(headers):
         t = QTableWidget(0, len(headers))
@@ -277,25 +357,59 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ run control
     def toggle(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.cancel()
+        if self.engine:
+            self.engine.cancel()
             self.start_btn.setEnabled(False)
             self.start_btn.setText("Stopping…")
             return
         self.reset_ui()
         cfg = TestConfig(download_seconds=self.dur.value(), upload_seconds=self.dur.value(),
                          streams=self.streams.value())
-        self.worker = Worker(cfg)
-        self.worker.event.connect(self.on_event)
-        self.worker.done.connect(self.on_done)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.finished.connect(self.on_finished)
         self.start_btn.setText("STOP")
         self.start_btn.setObjectName("stop")
         self.start_btn.setStyle(self.start_btn.style())
         self.dur.setEnabled(False)
         self.streams.setEnabled(False)
-        self.worker.start()
+        self.phase_label = "Starting"
+        self.engine = EngineProcess(cfg)
+        self.poll.start()
+
+    def _poll_engine(self):
+        eng = self.engine
+        if eng is None:
+            self.poll.stop()
+            return
+        for msg in eng.messages():
+            kind = msg[0]
+            try:
+                if kind == "event":
+                    self.on_event(msg[1], msg[2])
+                elif kind == "done":
+                    eng.finished = True
+                    self.on_done(msg[1])
+                elif kind == "failed":
+                    eng.finished = True
+                    self.on_failed(msg[1])
+            except Exception as e:  # a UI bug must not leave the test running headless
+                self._log(f"UI error handling {kind}: {type(e).__name__}: {e}")
+        elapsed = time.monotonic() - eng.started
+        self.status_lbl.setText(f"{SPINNER[int(elapsed * 8) % len(SPINNER)]} {elapsed:3.0f} s")
+        if eng.stop_requested and time.monotonic() - eng.stop_requested > STOP_GRACE_S:
+            eng.kill()
+        if not eng.alive():
+            for msg in eng.messages():  # anything still in the pipe
+                if msg[0] == "event":
+                    self.on_event(msg[1], msg[2])
+                elif msg[0] in ("done", "failed"):
+                    eng.finished = True
+                    (self.on_done if msg[0] == "done" else self.on_failed)(msg[1])
+            if not eng.finished:
+                self.on_failed("Test cancelled." if eng.stop_requested else
+                               f"The test process exited unexpectedly (code {eng.proc.exitcode}).")
+            self.engine = None
+            self.poll.stop()
+            self.status_lbl.setText(f"{elapsed:.0f} s")
+            self.on_finished()
 
     def reset_ui(self):
         for c in self.cards.values():
@@ -304,9 +418,9 @@ class MainWindow(QMainWindow):
         self.lat_chart.clear()
         self.box.set_rows([])
         self.layer_chart.set_rows([])
-        self.progress.setValue(0)
+        self.progress.set_target(0)
         self.gauge.set_value(0, "Starting…", DL, "Mbps")
-        self.verdict.setText("Testing…")
+        self.verdict.setText("Starting test engine…")
         self.log.clear()
         self.idle_ms = None
 
@@ -328,8 +442,9 @@ class MainWindow(QMainWindow):
         if ev == "log":
             self._log(d["msg"])
         elif ev == "progress":
-            self.progress.setValue(int(d["value"] * 1000))
+            self.progress.set_target(d["value"] * 1000)
         elif ev == "phase":
+            self.phase_label = d["label"]
             self.verdict.setText(d["label"] + "…")
             color = UL if d["name"] == "upload" else DL
             unit = "Mbps" if d["name"] in ("download", "upload") else "ms"
@@ -432,7 +547,7 @@ class MainWindow(QMainWindow):
         self.diag_view.setHtml(self._diagnosis_html(r))
         self._fill_activities(r)
         self._fill_tree(r)
-        self.progress.setValue(1000)
+        self.progress.set_target(1000)
 
     def _diagnosis_html(self, r):
         issues = diagnosis.diagnose(r)
@@ -699,15 +814,23 @@ class MainWindow(QMainWindow):
                 json.dump(out, f, indent=2)
 
     def closeEvent(self, e):
-        if self.worker and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(5000)
+        if self.engine:
+            self.engine.cancel()
+            self.engine.proc.join(2)
+            self.engine.kill()
         super().closeEvent(e)
 
 
 def main():
+    if sys.platform == "win32":
+        try:  # own taskbar entry/icon instead of python.exe's when run from source
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NetQuality.App")
+        except (OSError, AttributeError):
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("NetQuality")
+    app.setWindowIcon(app_icon())
     app.setStyleSheet(STYLE)
     w = MainWindow()
     w.show()

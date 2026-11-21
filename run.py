@@ -1,5 +1,7 @@
 """Launch the NetQuality GUI:  python run.py"""
-from netquality.app import main
+import multiprocessing
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # the test engine runs in a child process (needed for the frozen .exe)
+    from netquality.app import main
     main()

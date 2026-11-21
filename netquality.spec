@@ -45,6 +45,7 @@ exe = EXE(
     upx_exclude=["vcruntime140.dll", "python3*.dll", "Qt6*.dll"],
     runtime_tmpdir=None,
     console=False,          # windowed app, no console window
+    icon="assets/netquality.ico",  # regenerate with tools/make_icon.py
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

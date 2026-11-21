@@ -1,11 +1,11 @@
-"""Custom painted widgets: speed gauge, line chart, latency box plot, metric card."""
+"""Custom painted widgets: speed gauge, line chart, latency box plot, metric card, responsive card grid."""
 from __future__ import annotations
 
 import math
 
-from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QFrame, QLabel, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFrame, QGridLayout, QLabel, QProgressBar, QSizePolicy, QVBoxLayout, QWidget
 
 BG = QColor("#12151c")
 PANEL = QColor("#1a1e27")
@@ -35,21 +35,38 @@ class Gauge(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.value = 0.0
+        self.value = 0.0      # value currently drawn (eases toward target)
+        self.target = 0.0
         self.unit = "Mbps"
         self.caption = "Ready"
         self.color = DL
-        self.setMinimumSize(280, 240)
+        self.setMinimumSize(170, 140)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._anim = QTimer(self)
+        self._anim.setInterval(16)  # ~60 fps while the needle is moving
+        self._anim.timeout.connect(self._step)
 
     def set_value(self, v: float, caption: str | None = None, color: QColor | None = None, unit: str | None = None):
-        self.value = max(0.0, v)
+        if unit is not None and unit != self.unit:
+            self.value = 0.0  # different scale: restart the needle from zero
+        self.target = max(0.0, v)
         if caption is not None:
             self.caption = caption
         if color is not None:
             self.color = color
         if unit is not None:
             self.unit = unit
+        if not self._anim.isActive():
+            self._anim.start()
+        self.update()
+
+    def _step(self):
+        diff = self.target - self.value
+        if abs(diff) < max(0.05, abs(self.target) * 0.002):
+            self.value = self.target
+            self._anim.stop()
+        else:
+            self.value += diff * 0.2
         self.update()
 
     def _frac(self, v: float) -> float:
@@ -64,9 +81,10 @@ class Gauge(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        side = min(self.width(), self.height() * 1.15)
-        r = side * 0.42
-        c = QPointF(self.width() / 2, self.height() * 0.55)
+        # vertical extent: arc top (r + pen/2) down to the caption bottom (0.94 r) -> ~2.0 r in total
+        r = max(10.0, min(self.width() * 0.44, (self.height() - 8) / 2.02))
+        top = (self.height() - r * 2.02) / 2
+        c = QPointF(self.width() / 2, top + r * 1.06)
         rect = QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r)
         start, span = 225.0, -270.0
         pen = QPen(GRID, r * 0.12, cap=Qt.PenCapStyle.RoundCap)
@@ -80,7 +98,7 @@ class Gauge(QWidget):
         # tick labels
         p.setPen(MUTED)
         f = QFont(self.font())
-        f.setPointSizeF(max(7.0, r * 0.065))
+        f.setPointSizeF(max(6.5, r * 0.065))
         p.setFont(f)
         if self.unit == "Mbps":
             for i, t in enumerate(self.TICKS):
@@ -93,13 +111,13 @@ class Gauge(QWidget):
         p.drawLine(QPointF(c.x() + math.cos(a) * r * 0.2, c.y() - math.sin(a) * r * 0.2),
                    QPointF(c.x() + math.cos(a) * r * 0.58, c.y() - math.sin(a) * r * 0.58))
         # value text
-        f.setPointSizeF(max(14.0, r * 0.24))
+        f.setPointSizeF(max(12.0, r * 0.24))
         f.setBold(True)
         p.setFont(f)
         p.setPen(TEXT)
         txt = f"{self.value:.1f}" if self.value < 100 else f"{self.value:.0f}"
         p.drawText(QRectF(c.x() - r, c.y() + r * 0.15, 2 * r, r * 0.35), Qt.AlignmentFlag.AlignCenter, txt)
-        f.setPointSizeF(max(8.0, r * 0.08))
+        f.setPointSizeF(max(7.5, r * 0.08))
         f.setBold(False)
         p.setFont(f)
         p.setPen(MUTED)
@@ -116,7 +134,7 @@ class LineChart(QWidget):
         self.title, self.x_label, self.y_label = title, x_label, y_label
         self.series: dict[str, tuple[QColor, list[tuple[float, float]]]] = {}
         self.x_ticks: list[str] | None = None  # optional categorical labels
-        self.setMinimumHeight(180)
+        self.setMinimumHeight(130)
 
     def clear(self):
         self.series.clear()
@@ -134,14 +152,19 @@ class LineChart(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), PANEL)
-        L, R, T, B = 52, 14, 42, 26
+        L, R, T, B = 52, 14, 34, 26
         w, h = self.width() - L - R, self.height() - T - B
         p.setPen(TEXT)
         f = QFont(self.font())
         f.setBold(True)
         p.setFont(f)
         p.drawText(QRectF(10, 4, self.width() - 20, 20), Qt.AlignmentFlag.AlignLeft, self.title)
+        title_w = p.fontMetrics().horizontalAdvance(self.title)
         f.setBold(False)
+        p.setFont(f)
+        if self.y_label:  # unit next to the title, so it never collides with the axis labels
+            p.setPen(MUTED)
+            p.drawText(QRectF(10 + title_w + 8, 4, 120, 20), Qt.AlignmentFlag.AlignLeft, f"({self.y_label})")
         f.setPointSizeF(max(7.0, f.pointSizeF() - 1))
         p.setFont(f)
         pts = [pt for _, (_, s) in self.series.items() for pt in s if pt[1] is not None]
@@ -158,12 +181,13 @@ class LineChart(QWidget):
         def map_pt(x, y):
             return QPointF(L + (x - xmin) / (xmax - xmin) * w, T + h - min(y, ymax) / ymax * h)
 
-        for i in range(5):
-            y = T + h * i / 4
+        n = max(1, min(4, int(h // 26)))  # fewer gridlines on short charts so labels don't overlap
+        for i in range(n + 1):
+            y = T + h * i / n
             p.setPen(QPen(GRID, 1))
             p.drawLine(QPointF(L, y), QPointF(L + w, y))
             p.setPen(MUTED)
-            v = ymax * (4 - i) / 4
+            v = ymax * (n - i) / n
             p.drawText(QRectF(0, y - 8, L - 6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                        f"{v:.0f}" if v >= 10 else f"{v:.1f}")
         p.setPen(MUTED)
@@ -172,8 +196,6 @@ class LineChart(QWidget):
             px = L + w * i / 5
             label = self.x_ticks[min(len(self.x_ticks) - 1, round(x))] if self.x_ticks else f"{x:.0f}{self.x_label}"
             p.drawText(QRectF(px - 45, T + h + 4, 90, 16), Qt.AlignmentFlag.AlignCenter, label)
-        if self.y_label:
-            p.drawText(QRectF(4, T - 16, L, 14), Qt.AlignmentFlag.AlignLeft, self.y_label)
 
         lx = L + w
         for name, (color, s) in reversed(list(self.series.items())):
@@ -202,7 +224,7 @@ class BoxPlot(QWidget):
         super().__init__(parent)
         self.title = title
         self.rows: list[tuple[str, QColor, dict]] = []
-        self.setMinimumHeight(170)
+        self.setMinimumHeight(150)
 
     def set_rows(self, rows):
         self.rows = [r for r in rows if r[2]]
@@ -256,29 +278,122 @@ class BoxPlot(QWidget):
                        f"med {s['median']:.0f}")
 
 
+class ElidedLabel(QLabel):
+    """Single-line label that shortens with "…" instead of forcing its parent wider; full text in the tooltip."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setText(text)
+
+    def setText(self, text: str):  # noqa: N802 (Qt naming)
+        self._full = text
+        self.setToolTip(text)
+        self._elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, e):  # noqa: N802
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self):
+        w = max(10, self.contentsRect().width())
+        super().setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, w))
+
+
 class MetricCard(QFrame):
     def __init__(self, title: str, unit: str = "", color: QColor = TEXT, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setContentsMargins(12, 6, 12, 6)
         lay.setSpacing(0)
-        self.t = QLabel(title.upper())
+        self.t = ElidedLabel(title.upper())
         self.t.setObjectName("cardTitle")
-        self.v = QLabel("—")
+        self.v = ElidedLabel("—")
         self.v.setObjectName("cardValue")
-        self.v.setStyleSheet(f"color: {color.name()};")
-        self.s = QLabel(unit)
+        self._color = color.name()
+        self.v.setStyleSheet(f"color: {self._color};")
+        self.s = ElidedLabel(unit)
         self.s.setObjectName("cardSub")
         self.unit = unit
         for wdg in (self.t, self.v, self.s):
             lay.addWidget(wdg)
 
     def set(self, value: str, sub: str | None = None, color: QColor | None = None):
-        self.v.setText(value)
-        self.s.setText(sub if sub is not None else self.unit)
-        if color is not None:
-            self.v.setStyleSheet(f"color: {color.name()};")
+        sub = sub if sub is not None else self.unit
+        if value != self.v.text():   # skip no-op updates: each one costs a relayout
+            self.v.setText(value)
+        if sub != self.s.text():
+            self.s.setText(sub)
+        if color is not None and color.name() != self._color:
+            self._color = color.name()
+            self.v.setStyleSheet(f"color: {self._color};")
+
+
+class CardGrid(QWidget):
+    """Lays cards out in as many columns as fit (2..max_cols) and reflows when resized."""
+
+    def __init__(self, cards, min_card_width: int = 160, max_cols: int = 5, parent=None):
+        super().__init__(parent)
+        self.cards = list(cards)
+        self.min_card_width = min_card_width
+        self.max_cols = max_cols
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(8)
+        self.cols = 0
+        self._reflow(2)
+
+    def _reflow(self, cols: int):
+        if cols == self.cols:
+            return
+        self.cols = cols
+        for c in self.cards:
+            self.grid.removeWidget(c)
+        for col in range(self.max_cols):
+            self.grid.setColumnStretch(col, 1 if col < cols else 0)
+        for i, c in enumerate(self.cards):
+            self.grid.addWidget(c, i // cols, i % cols)
+
+    def resizeEvent(self, e):  # noqa: N802
+        super().resizeEvent(e)
+        sp = self.grid.spacing()
+        cols = max(2, min(self.max_cols, (self.width() + sp) // (self.min_card_width + sp)))
+        if cols != self.cols:
+            QTimer.singleShot(0, lambda: self._reflow(cols))  # not from inside the resize itself
+
+
+class SmoothProgress(QProgressBar):
+    """Progress bar (0..1000) that glides to new values instead of jumping."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRange(0, 1000)
+        self._target = 0
+        self._anim = QTimer(self)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._step)
+
+    def set_target(self, v: float):
+        self._target = max(0, min(1000, int(v)))
+        if self._target < self.value():
+            self._anim.stop()
+            self.setValue(self._target)  # resets jump straight back
+        elif not self._anim.isActive():
+            self._anim.start()
+
+    def _step(self):
+        diff = self._target - self.value()
+        if diff <= 2:
+            self.setValue(self._target)
+            self._anim.stop()
+        else:
+            self.setValue(self.value() + max(1, int(diff * 0.15)))
 
 
 class LayerChart(QWidget):
@@ -291,7 +406,7 @@ class LayerChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rows: list[dict] = []
-        self.setMinimumHeight(250)
+        self.setMinimumHeight(200)
 
     def set_rows(self, rows):
         self.rows = rows
@@ -368,3 +483,62 @@ class LayerChart(QWidget):
             p.setFont(f)
             p.setPen(MUTED)
             p.drawText(QRectF(22, cy, L - 26, 18), Qt.AlignmentFlag.AlignVCenter, row.get("method", ""))
+
+
+def paint_logo(p: QPainter, size: float) -> None:
+    """NetQuality mark: a dark rounded tile with a speedometer arc (cyan → violet, download → upload)
+    and a needle near the top of the scale. Drawn in code so it scales cleanly from 16 px to 256 px."""
+    from PyQt6.QtGui import QConicalGradient, QLinearGradient
+
+    s = float(size)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    bg = QLinearGradient(0, 0, 0, s)
+    bg.setColorAt(0, QColor("#232a38"))
+    bg.setColorAt(1, QColor("#10131a"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(bg)
+    p.drawRoundedRect(QRectF(0, 0, s, s), s * 0.22, s * 0.22)
+
+    c = QPointF(s / 2, s * 0.56)
+    r = s * 0.31
+    width = max(2.0, s * 0.11)
+    rect = QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r)
+    start, span = 225.0, -270.0
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QColor("#2f3747"), width, cap=Qt.PenCapStyle.RoundCap))
+    p.drawArc(rect, int(start * 16), int(span * 16))
+    frac = 0.78
+    # conical gradients sweep counter-clockwise; start at the needle end so the colour runs violet → cyan back
+    # to the arc start, i.e. cyan at low speed and violet near the top of the scale
+    grad2 = QConicalGradient(c, start + span * frac)
+    grad2.setColorAt(0.0, UL)
+    grad2.setColorAt(frac * 270 / 360, DL)
+    grad2.setColorAt(1.0, UL)
+    p.setPen(QPen(grad2, width, cap=Qt.PenCapStyle.RoundCap))
+    p.drawArc(rect, int(start * 16), int(span * frac * 16))
+
+    a = math.radians(start + span * frac)
+    tip = QPointF(c.x() + math.cos(a) * r * 0.72, c.y() - math.sin(a) * r * 0.72)
+    p.setPen(QPen(TEXT, max(1.5, s * 0.06), cap=Qt.PenCapStyle.RoundCap))
+    p.drawLine(c, tip)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(TEXT)
+    p.drawEllipse(c, s * 0.065, s * 0.065)
+
+
+def logo_image(size: int):
+    from PyQt6.QtGui import QImage
+    img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    paint_logo(p, size)
+    p.end()
+    return img
+
+
+def app_icon():
+    from PyQt6.QtGui import QIcon, QPixmap
+    icon = QIcon()
+    for sz in (16, 20, 24, 32, 40, 48, 64, 128, 256):
+        icon.addPixmap(QPixmap.fromImage(logo_image(sz)))
+    return icon
